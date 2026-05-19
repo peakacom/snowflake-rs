@@ -17,7 +17,9 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::sync::Arc;
 
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, StructArray, TimestampMicrosecondArray};
 use arrow_ipc::reader::StreamReader;
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use base64::Engine;
 use bytes::{Buf, Bytes};
 use futures::future::try_join_all;
@@ -180,8 +182,169 @@ impl RawQueryResult {
 
     fn bytes_to_batches(bytes: Bytes) -> Result<Vec<RecordBatch>, ArrowError> {
         let record_batches = StreamReader::try_new(bytes.reader(), None)?;
-        record_batches.into_iter().collect()
+        record_batches
+            .into_iter()
+            .map(|r| r.and_then(flatten_snowflake_types))
+            .collect()
     }
+}
+
+// Snowflake encodes some logical types as Arrow `Struct`s with field-level
+// metadata pinning the logical type. The federation/DataFusion side expects
+// the corresponding native Arrow type, so we flatten here at the decode
+// boundary. Currently handles `TIMESTAMP_NTZ` (`Struct{epoch, fraction}` →
+// `Timestamp(Microsecond, None)`); siblings `TIMESTAMP_LTZ`/`TIMESTAMP_TZ`
+// have the same shape plus a timezone field and can be added when needed.
+
+const SNOWFLAKE_LOGICAL_TYPE_KEY: &str = "logicalType";
+const SNOWFLAKE_SCALE_KEY: &str = "scale";
+const SNOWFLAKE_TIMESTAMP_NTZ: &str = "TIMESTAMP_NTZ";
+
+fn flatten_snowflake_types(batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+    let schema = batch.schema();
+    let mut new_fields: Vec<Arc<Field>> = Vec::with_capacity(schema.fields().len());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    let mut changed = false;
+
+    for (idx, field) in schema.fields().iter().enumerate() {
+        let column = batch.column(idx);
+        if is_snowflake_timestamp_ntz_struct(field, column) {
+            let (new_field, new_column) = flatten_timestamp_ntz_column(field, column)?;
+            new_fields.push(Arc::new(new_field));
+            new_columns.push(new_column);
+            changed = true;
+        } else {
+            new_fields.push(field.clone());
+            new_columns.push(column.clone());
+        }
+    }
+
+    if !changed {
+        return Ok(batch);
+    }
+
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    ));
+    RecordBatch::try_new(new_schema, new_columns)
+}
+
+fn is_snowflake_timestamp_ntz_struct(field: &Field, column: &ArrayRef) -> bool {
+    matches!(column.data_type(), DataType::Struct(_))
+        && field
+            .metadata()
+            .get(SNOWFLAKE_LOGICAL_TYPE_KEY)
+            .is_some_and(|v| v == SNOWFLAKE_TIMESTAMP_NTZ)
+}
+
+fn flatten_timestamp_ntz_column(
+    field: &Field,
+    column: &ArrayRef,
+) -> Result<(Field, ArrayRef), ArrowError> {
+    let scale: u32 = field
+        .metadata()
+        .get(SNOWFLAKE_SCALE_KEY)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9);
+
+    let struct_array = column
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .ok_or_else(|| {
+            ArrowError::SchemaError(format!(
+                "expected Struct column for TIMESTAMP_NTZ field `{}`",
+                field.name()
+            ))
+        })?;
+
+    let epoch = struct_array
+        .column_by_name("epoch")
+        .ok_or_else(|| {
+            ArrowError::SchemaError(format!(
+                "TIMESTAMP_NTZ struct `{}` missing `epoch` child",
+                field.name()
+            ))
+        })?
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| {
+            ArrowError::SchemaError(format!(
+                "TIMESTAMP_NTZ `{}` epoch child is not Int64",
+                field.name()
+            ))
+        })?;
+
+    let fraction = struct_array
+        .column_by_name("fraction")
+        .map(|c| {
+            c.as_any().downcast_ref::<Int32Array>().ok_or_else(|| {
+                ArrowError::SchemaError(format!(
+                    "TIMESTAMP_NTZ `{}` fraction child is not Int32",
+                    field.name()
+                ))
+            })
+        })
+        .transpose()?;
+
+    let len = struct_array.len();
+    let mut builder = TimestampMicrosecondArray::builder(len);
+
+    for i in 0..len {
+        // Snowflake may signal a null TIMESTAMP_NTZ either by nulling the
+        // parent struct or by nulling the `epoch` child — accept both.
+        if struct_array.is_null(i) || epoch.is_null(i) {
+            builder.append_null();
+            continue;
+        }
+
+        let secs = epoch.value(i);
+        let fr_units = fraction.map_or(0_i64, |f| {
+            if f.is_null(i) {
+                0_i64
+            } else {
+                i64::from(f.value(i))
+            }
+        });
+
+        // `scale` is the precision of `fraction` in negative powers of ten
+        // (scale=9 → nanoseconds, scale=6 → microseconds, etc.). Convert the
+        // sub-second portion to microseconds before adding to `epoch * 1e6`.
+        let frac_micros = if scale <= 6 {
+            fr_units
+                .checked_mul(10_i64.pow(6 - scale))
+                .ok_or_else(|| overflow_err(field.name(), i))?
+        } else {
+            fr_units / 10_i64.pow(scale - 6)
+        };
+
+        let micros = secs
+            .checked_mul(1_000_000)
+            .and_then(|s| s.checked_add(frac_micros))
+            .ok_or_else(|| overflow_err(field.name(), i))?;
+
+        builder.append_value(micros);
+    }
+
+    let new_array: ArrayRef = Arc::new(builder.finish());
+    let mut new_metadata = field.metadata().clone();
+    new_metadata.remove(SNOWFLAKE_LOGICAL_TYPE_KEY);
+    new_metadata.remove(SNOWFLAKE_SCALE_KEY);
+
+    let new_field = Field::new(
+        field.name(),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        field.is_nullable(),
+    )
+    .with_metadata(new_metadata);
+
+    Ok((new_field, new_array))
+}
+
+fn overflow_err(name: &str, row: usize) -> ArrowError {
+    ArrowError::CastError(format!(
+        "TIMESTAMP_NTZ `{name}` overflows i64 microseconds at row {row}"
+    ))
 }
 
 pub struct AuthArgs {
@@ -511,5 +674,114 @@ impl SnowflakeApi {
             .await?;
 
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    use arrow_schema::{Field, Fields};
+
+    fn ntz_struct_column(
+        epochs: Vec<Option<i64>>,
+        fractions: Vec<Option<i32>>,
+    ) -> (Field, ArrayRef) {
+        let epoch = Arc::new(Int64Array::from(epochs)) as ArrayRef;
+        let fraction = Arc::new(Int32Array::from(fractions)) as ArrayRef;
+        let fields = Fields::from(vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+        ]);
+        let struct_array =
+            StructArray::new(fields.clone(), vec![epoch, fraction], None);
+
+        let mut meta = HashMap::new();
+        meta.insert(SNOWFLAKE_LOGICAL_TYPE_KEY.to_string(), SNOWFLAKE_TIMESTAMP_NTZ.to_string());
+        meta.insert(SNOWFLAKE_SCALE_KEY.to_string(), "9".to_string());
+
+        let field = Field::new("ts", DataType::Struct(fields), true).with_metadata(meta);
+        (field, Arc::new(struct_array))
+    }
+
+    #[test]
+    fn flatten_timestamp_ntz_scale_9() {
+        // 2026-01-02 03:04:05.123456789 UTC = 1767322445 seconds + 123_456_789 ns
+        // Expected micros: 1767322445_000000 + 123_456 = 1767322445_123456
+        let (field, column) = ntz_struct_column(
+            vec![Some(1_767_322_445), None, Some(0)],
+            vec![Some(123_456_789), None, Some(0)],
+        );
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+
+        let flat = flatten_snowflake_types(batch).unwrap();
+        assert_eq!(
+            flat.schema().field(0).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let ts = flat
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("flattened to TimestampMicrosecondArray");
+        assert_eq!(ts.value(0), 1_767_322_445_123_456);
+        assert!(ts.is_null(1));
+        assert_eq!(ts.value(2), 0);
+        // Metadata pinning should be consumed by the flatten step.
+        assert!(!flat
+            .schema()
+            .field(0)
+            .metadata()
+            .contains_key(SNOWFLAKE_LOGICAL_TYPE_KEY));
+    }
+
+    #[test]
+    fn flatten_timestamp_ntz_parent_null_buffer() {
+        // Same shape, but the null is signalled on the parent struct rather
+        // than the `epoch` child — Snowflake uses either depending on the
+        // batch source, so both must yield `is_null` rows.
+        use arrow_buffer::NullBuffer;
+        let epoch = Arc::new(Int64Array::from(vec![1_767_322_445_i64, 0, 0])) as ArrayRef;
+        let fraction = Arc::new(Int32Array::from(vec![123_456_789_i32, 0, 0])) as ArrayRef;
+        let fields = Fields::from(vec![
+            Field::new("epoch", DataType::Int64, true),
+            Field::new("fraction", DataType::Int32, true),
+        ]);
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array = StructArray::new(fields.clone(), vec![epoch, fraction], Some(nulls));
+
+        let mut meta = HashMap::new();
+        meta.insert(
+            SNOWFLAKE_LOGICAL_TYPE_KEY.to_string(),
+            SNOWFLAKE_TIMESTAMP_NTZ.to_string(),
+        );
+        meta.insert(SNOWFLAKE_SCALE_KEY.to_string(), "9".to_string());
+        let field = Field::new("ts", DataType::Struct(fields), true).with_metadata(meta);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(struct_array)]).unwrap();
+
+        let flat = flatten_snowflake_types(batch).unwrap();
+        let ts = flat
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(ts.value(0), 1_767_322_445_123_456);
+        assert!(ts.is_null(1));
+        assert_eq!(ts.value(2), 0);
+    }
+
+    #[test]
+    fn flatten_pass_through_when_no_marker() {
+        let epoch = Arc::new(Int64Array::from(vec![1_i64, 2, 3])) as ArrayRef;
+        let field = Field::new("plain", DataType::Int64, false);
+        let schema = Arc::new(Schema::new(vec![field]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![epoch.clone()]).unwrap();
+
+        let flat = flatten_snowflake_types(batch).unwrap();
+        assert_eq!(flat.schema(), schema);
+        assert_eq!(flat.column(0).as_ref(), epoch.as_ref());
     }
 }
